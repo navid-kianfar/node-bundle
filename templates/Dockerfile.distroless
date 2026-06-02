@@ -1,0 +1,38 @@
+# =============================================================================
+# Run a node-bundle artifact in a minimal, hardened image.
+#
+# IMPORTANT: the binaries pkg produces are glibc-based. Use a glibc runtime
+#            (distroless/cc, debian-slim, ubuntu). DO NOT use Alpine/musl —
+#            the binary will fail with "not found" / loader errors.
+#
+# node-bundle names outputs with Node arch tokens: <name>-linux-x64 / -arm64.
+# Docker's TARGETARCH uses amd64/arm64, so the picker stage maps them.
+# =============================================================================
+
+# ---- Single architecture (simplest) ----------------------------------------
+# Uncomment this block and delete the multi-arch block below if you only ship one arch.
+#
+# FROM gcr.io/distroless/cc-debian12
+# COPY node-bundle-out/myapp-linux-x64 /usr/local/bin/myapp
+# ENTRYPOINT ["/usr/local/bin/myapp"]
+
+
+# ---- Multi-architecture (docker buildx --platform linux/amd64,linux/arm64) --
+FROM debian:bookworm-slim AS picker
+ARG TARGETARCH
+WORKDIR /pick
+COPY node-bundle-out/ ./
+# Map Docker's amd64/arm64 -> node-bundle's x64/arm64, then stage one binary.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) A=x64 ;; \
+      arm64) A=arm64 ;; \
+      *)     A="$TARGETARCH" ;; \
+    esac; \
+    cp "myapp-linux-${A}" /myapp; \
+    chmod +x /myapp
+
+FROM gcr.io/distroless/cc-debian12
+COPY --from=picker /myapp /usr/local/bin/myapp
+# distroless has no shell — exec form is required.
+ENTRYPOINT ["/usr/local/bin/myapp"]

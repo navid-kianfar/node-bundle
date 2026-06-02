@@ -1,0 +1,10 @@
+/** Programmatic API for node-bundle. */
+export { detect } from './detect.js'
+export { resolveConfig, parseTargets, normalizeArch, type CliOptions } from './config.js'
+export { decideMode, runHost, hostTarget, formatBytes, type RunResult } from './orchestrate.js'
+export { runDocker } from './docker.js'
+export { bundleApp } from './bundle.js'
+export { obfuscateCode } from './obfuscate.js'
+export { pack } from './pack.js'
+export { scanNatives } from './natives.js'
+export * from './types.js'

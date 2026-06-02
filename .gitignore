@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.idea/
+*.log
+
+# node-bundle working + output dirs
+.node-bundle/
+node-bundle-out/
+
+# example build artifacts
+examples/**/dist/
+examples/**/node_modules/
+examples/**/out/

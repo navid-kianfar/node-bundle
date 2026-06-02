@@ -1,0 +1,45 @@
+{
+  "name": "node-bundle",
+  "version": "0.1.0",
+  "description": "Bundle & protect a Node.js app into a single self-contained, bytecode-compiled executable, per CPU architecture (amd64/arm64).",
+  "type": "module",
+  "bin": {
+    "node-bundle": "dist/cli.cjs"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "bundle",
+    "obfuscate",
+    "bytecode",
+    "pkg",
+    "protect",
+    "single-executable",
+    "nodejs"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@yao-pkg/pkg": "^6.20.0",
+    "commander": "^15.0.0",
+    "esbuild": "^0.28.0",
+    "fast-glob": "^3.3.3",
+    "javascript-obfuscator": "^5.4.3",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

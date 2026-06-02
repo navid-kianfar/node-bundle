@@ -1,0 +1,15 @@
+{
+  "$comment": "Drop this file (named node-bundle.config.json) in your project root. CLI flags override it.",
+  "name": "myapp",
+  "node": "22",
+  "targets": "linux-x64,linux-arm64",
+  "mode": "auto",
+  "obfuscate": "safe",
+  "bytecode": true,
+  "build": true,
+  "buildCommand": "npm run build",
+  "entry": "dist/main.js",
+  "assets": ["views/**/*", "config/*.json"],
+  "externals": ["bcrypt", "sharp"],
+  "ext": ""
+}
