@@ -92,6 +92,33 @@ Run one (no Node required on the host):
 Native `.node` addons are **architecture-specific machine code** and cannot be
 cross-compiled by copying — `auto` will route those builds through Docker.
 
+## Monorepos (pnpm workspaces)
+
+If your app is a package inside a pnpm workspace (its deps use `workspace:*`), a plain
+single-folder build can't resolve those internal packages or the shared base tsconfig.
+Use `--monorepo` — point it at the package directory and the tool will, inside each
+per-arch Linux container:
+
+1. find the workspace root (`pnpm-workspace.yaml`),
+2. `pnpm install` → `pnpm --filter <pkg>... build` → `pnpm --filter <pkg> deploy --prod`
+   (producing a self-contained package), then
+3. bundle + obfuscate + bytecode-pack that deployed package.
+
+```bash
+node-bundle path/to/providers/whatsapp --monorepo \
+  --workspace-include providers \
+  --targets amd64,arm64 --out ./out --name whatsapp
+```
+
+- `--workspace-include providers` copies only that top-level subtree into the build
+  context (much faster than copying a monorepo that also contains a big frontend).
+  Omit it to copy the whole workspace.
+- Requires **pnpm** + **Docker** (the recipe runs in containers so native addons and
+  bytecode are produced for each target arch).
+- **Native modules must be in the deployed closure.** Optional peers (e.g. `better-sqlite3`
+  behind drizzle) and dynamically-resolved natives (e.g. `sharp`) may be dropped by
+  `pnpm deploy --prod`; ensure they're real dependencies (or add them) so they get embedded.
+
 ## CLI reference
 
 ```
@@ -114,6 +141,8 @@ node-bundle [projectDir] [options]
       --keep-temp          keep the .node-bundle/ working dir
       --esbuild-target <t> esbuild target (default: node<version>)
       --analyze            detect & print a report, then exit
+      --monorepo           build a pnpm-workspace package (install+build+deploy, then bundle)
+      --workspace-include <list>  monorepo: only copy these top-level subtrees (faster)
 ```
 
 ### Architecture aliases

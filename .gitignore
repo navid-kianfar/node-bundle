@@ -3,6 +3,9 @@ dist/
 .idea/
 *.log
 
+# Claude / memory MCP local state
+.claude-memory/
+
 # node-bundle working + output dirs
 .node-bundle/
 node-bundle-out/

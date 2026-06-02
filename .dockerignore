@@ -1,0 +1,8 @@
+node_modules
+examples
+.git
+.idea
+.node-bundle
+node-bundle-out
+*.log
+.integration

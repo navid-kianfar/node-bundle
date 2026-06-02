@@ -1,0 +1,9 @@
+{
+  "name": "sqlite-demo",
+  "version": "1.0.0",
+  "description": "Minimal app exercising a native addon (better-sqlite3) end-to-end.",
+  "main": "index.js",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  }
+}

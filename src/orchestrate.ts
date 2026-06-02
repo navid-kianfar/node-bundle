@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { BuildArtifact, DetectResult, ResolvedConfig, Target } from './types.js'
 import { log, pc } from './logger.js'
-import { bundleApp } from './bundle.js'
+import { bundleApp, packageNameOf, type BundleResult } from './bundle.js'
 import { obfuscateCode } from './obfuscate.js'
 import { pack } from './pack.js'
 import { installCmd } from './pm.js'
@@ -152,48 +152,76 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
   })
 
   // Re-scan natives now that everything is installed/built.
-  const natives = (await scanNatives(projectDir)).packages
+  const nativeScan = await scanNatives(projectDir)
+  const natives = nativeScan.packages
   const externals = Array.from(new Set([...config.externals, ...natives]))
 
   const entry = resolveEntry(config, detected)
-  log.step('Bundle')
+  log.step('Bundle & protect')
   fs.rmSync(tmpDir, { recursive: true, force: true })
   fs.mkdirSync(tmpDir, { recursive: true })
 
-  const bundleFile = path.join(tmpDir, 'bundle.cjs')
-  const result = await log.groupAsync(async () => {
+  const finalBundle = path.join(tmpDir, 'bundle.cjs')
+  const entryForPkg = finalBundle
+
+  const logExtras = (r: BundleResult) => {
+    for (const w of r.warnings) log.warn(w)
+    if (r.externalizedMissing.length) {
+      const shown = r.externalizedMissing.slice(0, 8).join(', ')
+      const more = r.externalizedMissing.length > 8 ? `, … (+${r.externalizedMissing.length - 8})` : ''
+      log.info(`Auto-externalized ${r.externalizedMissing.length} unresolved/optional import(s): ${shown}${more}`)
+    }
+  }
+
+  const result = await log.groupAsync(async (): Promise<BundleResult> => {
     log.info(`Entry: ${pc.bold(path.relative(projectDir, entry) || entry)}`)
     if (externals.length) log.info(`External (native) packages: ${externals.join(', ')}`)
-    const r = await bundleApp({
-      entry,
-      outFile: bundleFile,
-      externals,
-      target: config.esbuildTarget,
-      minify: false,
-    })
-    log.success(`Bundled → ${formatBytes(r.size)}`)
-    for (const w of r.warnings) log.warn(w)
-    return r
-  })
+    const esTarget = config.esbuildTarget
 
-  // 3. Obfuscate
-  let entryForPkg = bundleFile
-  log.step('Obfuscate')
-  log.group(() => {
     if (config.obfuscate === 'off') {
-      log.info('Disabled (--obfuscate off)')
-      return
+      const r = await bundleApp({ entry, outFile: finalBundle, externals, target: esTarget, minify: false })
+      log.success(`Bundled → ${formatBytes(r.size)}`)
+      logExtras(r)
+      log.warn('Obfuscation disabled — only bytecode protects this build.')
+      return r
     }
-    const code = fs.readFileSync(bundleFile, 'utf8')
-    const obf = obfuscateCode(code, config.obfuscate, externals)
-    const obfFile = path.join(tmpDir, 'bundle.obf.cjs')
-    fs.writeFileSync(obfFile, obf)
-    entryForPkg = obfFile
-    log.success(`Obfuscated (${config.obfuscate}) → ${formatBytes(Buffer.byteLength(obf))}`)
+
+    // Stage A — bundle ONLY the app's own code (all packages external). Small input
+    // → obfuscation is fast and targets your IP, not megabytes of third-party deps.
+    const appOnly = path.join(tmpDir, 'app.cjs')
+    const a = await bundleApp({
+      entry,
+      outFile: appOnly,
+      externals,
+      target: esTarget,
+      minify: false,
+      externalizeAllPackages: true,
+    })
+    log.success(`App code bundled → ${formatBytes(a.size)} ${pc.dim(`(scope for obfuscation)`)}`)
+
+    // Reserve every specifier the app references so the obfuscator keeps them as
+    // literal require()s — otherwise Stage B can't inline them / pkg can't trace them.
+    const reserved = Array.from(
+      new Set([...externals, ...a.externalized, ...a.externalized.map(packageNameOf)]),
+    )
+    const obfApp = path.join(tmpDir, 'app.obf.cjs')
+    fs.writeFileSync(obfApp, obfuscateCode(fs.readFileSync(appOnly, 'utf8'), config.obfuscate, reserved))
+    log.success(`Obfuscated app code (${config.obfuscate})`)
+
+    // Stage B — bundle the obfuscated app together with all dependencies inlined.
+    const b = await bundleApp({ entry: obfApp, outFile: finalBundle, externals, target: esTarget, minify: false })
+    log.success(`Bundled with deps inlined → ${formatBytes(b.size)}`)
+    logExtras(b)
+    return b
   })
 
-  // 4. Write pkg config + pack per target
-  writePkgConfig(tmpDir, projectDir, config, entryForPkg)
+  // 4. Write pkg config + pack per target.
+  //    Native .node files are located at runtime via dynamic helpers (bindings,
+  //    node-gyp-build) that pkg can't statically follow — embed them explicitly.
+  writePkgConfig(tmpDir, projectDir, config, entryForPkg, nativeScan.files)
+  if (nativeScan.files.length) {
+    log.group(() => log.info(`Embedding ${nativeScan.files.length} native .node file(s) as assets`))
+  }
 
   log.step('Pack (bytecode + executable)')
   const outcome = await pack({
@@ -221,13 +249,14 @@ export function writePkgConfig(
   projectDir: string,
   config: ResolvedConfig,
   entryForPkg: string,
+  nativeFiles: string[] = [],
 ): void {
   // pkg resolves asset globs relative to this package.json — rewrite project-relative
-  // globs to be relative to tmpDir.
-  const assets = config.assets.map((glob) => {
-    const abs = path.resolve(projectDir, glob)
-    return path.relative(tmpDir, abs).split(path.sep).join('/')
-  })
+  // paths/globs to be relative to tmpDir.
+  const toTmpRel = (p: string) =>
+    path.relative(tmpDir, path.resolve(projectDir, p)).split(path.sep).join('/')
+
+  const assets = Array.from(new Set([...config.assets, ...nativeFiles].map(toTmpRel)))
 
   const pkgConfig = {
     name: config.name,
@@ -261,9 +290,6 @@ export function summarize(result: RunResult, config: ResolvedConfig): void {
         `Bytecode fell back to source for: ${result.bytecodeFailures.join(', ')}. ` +
           `Run with --mode docker to generate bytecode natively per architecture.`,
       )
-    }
-    if (config.obfuscate === 'off') {
-      log.warn('Obfuscation was disabled — only bytecode protects this build.')
     }
   })
 }

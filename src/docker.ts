@@ -1,7 +1,8 @@
 import { execFileSync, execSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
-import type { BuildArtifact, DetectResult, ResolvedConfig } from './types.js'
+import type { BuildArtifact, DetectResult, ResolvedConfig, Target } from './types.js'
 import { log, pc } from './logger.js'
 import type { RunResult } from './orchestrate.js'
 import { hostTarget } from './orchestrate.js'
@@ -27,13 +28,14 @@ function toolRoot(): string {
   return root
 }
 
-function writeDockerfile(contextDir: string, nodeRange: string): string {
+function writeDockerfile(contextDir: string, nodeRange: string): void {
   const dockerfile = `# syntax=docker/dockerfile:1
 FROM node:${nodeRange}-bookworm
 
-# Toolchain for building native addons during the target install
+# Toolchain for native addons (node-gyp) + git for git-hosted transitive deps,
+# + corepack so the target project's pinned pnpm/yarn is available.
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \\
+ && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates \\
  && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 
@@ -43,14 +45,75 @@ COPY dist ./dist
 RUN npm install --omit=dev --no-audit --no-fund
 
 ENV NODE_BUNDLE_IN_DOCKER=1
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 ENTRYPOINT ["node", "/opt/node-bundle/dist/cli.cjs"]
 `
-  const dfPath = path.join(contextDir, 'Dockerfile')
-  fs.writeFileSync(dfPath, dockerfile)
-  return dfPath
+  fs.writeFileSync(path.join(contextDir, 'Dockerfile'), dockerfile)
 }
 
-/** Build the args for the inner (in-container) node-bundle invocation. */
+/** Create the builder build-context (tool dist + Dockerfile) outside any project. */
+function setupBuilderContext(nodeRange: string): string {
+  const root = toolRoot()
+  const contextDir = path.join(os.tmpdir(), 'node-bundle-docker-ctx')
+  fs.rmSync(contextDir, { recursive: true, force: true })
+  fs.mkdirSync(contextDir, { recursive: true })
+  fs.copyFileSync(path.join(root, 'package.json'), path.join(contextDir, 'package.json'))
+  fs.cpSync(path.join(root, 'dist'), path.join(contextDir, 'dist'), { recursive: true })
+  writeDockerfile(contextDir, nodeRange)
+  return contextDir
+}
+
+function platformFlagFor(t: Target): string {
+  return `linux/${t.arch === 'x64' ? 'amd64' : t.arch}`
+}
+
+function ensureLinuxTargets(config: ResolvedConfig): void {
+  const nonLinux = config.targets.filter((t) => t.platform !== 'linux')
+  if (nonLinux.length) {
+    throw new Error(
+      `Docker mode only builds linux targets (got ${nonLinux
+        .map((t) => `${t.platform}-${t.arch}`)
+        .join(', ')}). Use --mode host for macOS/Windows targets.`,
+    )
+  }
+}
+
+function buildBuilderImage(contextDir: string, t: Target, image: string): void {
+  const host = hostTarget()
+  const emulated = host.arch !== t.arch
+  log.step(`Docker build: ${pc.bold(`${t.platform}-${t.arch}`)}${emulated ? pc.dim(' (emulated)') : ''}`)
+  log.group(() => {
+    log.info(`Builder image: ${image}`)
+    execSync(`docker build --platform ${platformFlagFor(t)} -t ${image} ${JSON.stringify(contextDir)}`, {
+      stdio: 'inherit',
+    })
+  })
+}
+
+function collectArtifact(config: ResolvedConfig, t: Target): BuildArtifact {
+  const outFile = path.join(config.outDir, `${config.name}-${t.platform}-${t.arch}${config.ext}`)
+  const exists = fs.existsSync(outFile)
+  if (exists) fs.chmodSync(outFile, 0o755)
+  return { target: t, path: outFile, size: exists ? fs.statSync(outFile).size : 0 }
+}
+
+/** Common docker run args (volumes/caches) shared by both flows. */
+function baseRunArgs(config: ResolvedConfig, t: Target): string[] {
+  return [
+    'run',
+    '--rm',
+    '--platform',
+    platformFlagFor(t),
+    '-v',
+    `${config.outDir}:/work/out`,
+    '-v',
+    'node-bundle-pkgcache:/root/.pkg-cache',
+    '-v',
+    'node-bundle-pnpmstore:/root/.local/share/pnpm',
+  ]
+}
+
+/** Args for the inner single-package invocation. */
 function innerArgs(config: ResolvedConfig, arch: string): string[] {
   const args = [
     '/work/project',
@@ -88,69 +151,95 @@ export async function runDocker(config: ResolvedConfig, _detected: DetectResult)
   if (!dockerAvailable()) {
     throw new Error('Docker is required for --mode docker but `docker version` failed. Is Docker running?')
   }
+  ensureLinuxTargets(config)
 
-  const nonLinux = config.targets.filter((t) => t.platform !== 'linux')
-  if (nonLinux.length) {
-    throw new Error(
-      `Docker mode only builds linux targets (got ${nonLinux
-        .map((t) => `${t.platform}-${t.arch}`)
-        .join(', ')}). Use --mode host for macOS/Windows targets.`,
-    )
-  }
-
-  const root = toolRoot()
-  const contextDir = path.join(config.projectDir, '.node-bundle', 'docker-ctx')
-  fs.rmSync(contextDir, { recursive: true, force: true })
-  fs.mkdirSync(contextDir, { recursive: true })
-  fs.copyFileSync(path.join(root, 'package.json'), path.join(contextDir, 'package.json'))
-  fs.cpSync(path.join(root, 'dist'), path.join(contextDir, 'dist'), { recursive: true })
-  writeDockerfile(contextDir, config.nodeRange)
-
+  const contextDir = setupBuilderContext(config.nodeRange)
   fs.mkdirSync(config.outDir, { recursive: true })
-
-  const host = hostTarget()
   const artifacts: BuildArtifact[] = []
 
   for (const t of config.targets) {
-    const platformFlag = `linux/${t.arch === 'x64' ? 'amd64' : t.arch}`
     const image = `node-bundle-builder:node${config.nodeRange}-${t.arch}`
-    const emulated = host.arch !== t.arch
-
-    log.step(`Docker build: ${pc.bold(`${t.platform}-${t.arch}`)}${emulated ? pc.dim(' (emulated)') : ''}`)
-    log.group(() => {
-      log.info(`Builder image: ${image}`)
-      execSync(`docker build --platform ${platformFlag} -t ${image} ${JSON.stringify(contextDir)}`, {
-        stdio: 'inherit',
-      })
-    })
+    buildBuilderImage(contextDir, t, image)
 
     log.step(`Pack in container: ${pc.bold(`${t.platform}-${t.arch}`)}`)
-    const runArgs = [
-      'run',
-      '--rm',
-      '--platform',
-      platformFlag,
-      '-v',
-      `${config.projectDir}:/work/project:ro`,
-      '-v',
-      `${config.outDir}:/work/out`,
-      '-v',
-      'node-bundle-pkgcache:/root/.pkg-cache',
-      image,
-      ...innerArgs(config, t.arch),
+    execFileSync(
+      'docker',
+      [
+        ...baseRunArgs(config, t),
+        '-v',
+        `${config.projectDir}:/work/project:ro`,
+        image,
+        ...innerArgs(config, t.arch),
+      ],
+      { stdio: 'inherit' },
+    )
+    artifacts.push(collectArtifact(config, t))
+  }
+
+  if (!config.keepTemp) fs.rmSync(contextDir, { recursive: true, force: true })
+  return { artifacts, bytecodeFailures: [], warnings: [] }
+}
+
+export interface MonorepoDockerOptions {
+  workspaceRoot: string
+  packageName: string
+  include?: string[]
+}
+
+/**
+ * Monorepo flow: mount the whole workspace (read-only) per arch, run the pnpm
+ * install/build/deploy recipe inside the container, then bundle the deployed app.
+ */
+export async function runMonorepoDocker(
+  config: ResolvedConfig,
+  opts: MonorepoDockerOptions,
+): Promise<RunResult> {
+  if (!dockerAvailable()) {
+    throw new Error('Docker is required for --monorepo but `docker version` failed. Is Docker running?')
+  }
+  ensureLinuxTargets(config)
+
+  const contextDir = setupBuilderContext(config.nodeRange)
+  fs.mkdirSync(config.outDir, { recursive: true })
+  const artifacts: BuildArtifact[] = []
+
+  for (const t of config.targets) {
+    const image = `node-bundle-builder:node${config.nodeRange}-${t.arch}`
+    buildBuilderImage(contextDir, t, image)
+
+    log.step(`Deploy + pack in container: ${pc.bold(`${t.platform}-${t.arch}`)}`)
+    const inner = [
+      '.',
+      '--monorepo-deploy',
+      '--monorepo-root',
+      '/work/mono',
+      '--monorepo-pkg',
+      opts.packageName,
+      '--targets',
+      `linux-${t.arch}`,
+      '--node',
+      config.nodeRange,
+      '--obfuscate',
+      config.obfuscate,
+      '--out',
+      '/work/out',
+      '--name',
+      config.name,
+      '--esbuild-target',
+      config.esbuildTarget,
     ]
-    execFileSync('docker', runArgs, { stdio: 'inherit' })
+    if (config.ext) inner.push('--ext', config.ext)
+    if (!config.bytecode) inner.push('--no-bytecode')
+    if (opts.include?.length) inner.push('--workspace-include', opts.include.join(','))
 
-    const outName = `${config.name}-${t.platform}-${t.arch}${config.ext}`
-    const outFile = path.join(config.outDir, outName)
-    const exists = fs.existsSync(outFile)
-    if (exists) fs.chmodSync(outFile, 0o755)
-    artifacts.push({ target: t, path: outFile, size: exists ? fs.statSync(outFile).size : 0 })
+    execFileSync(
+      'docker',
+      [...baseRunArgs(config, t), '-v', `${opts.workspaceRoot}:/work/mono:ro`, image, ...inner],
+      { stdio: 'inherit' },
+    )
+    artifacts.push(collectArtifact(config, t))
   }
 
-  if (!config.keepTemp) {
-    fs.rmSync(path.join(config.projectDir, '.node-bundle'), { recursive: true, force: true })
-  }
-
+  if (!config.keepTemp) fs.rmSync(contextDir, { recursive: true, force: true })
   return { artifacts, bytecodeFailures: [], warnings: [] }
 }
