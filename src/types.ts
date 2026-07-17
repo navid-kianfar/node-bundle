@@ -12,6 +12,32 @@ export interface Target {
   arch: 'x64' | 'arm64' | 'armv7'
 }
 
+/** A static directory shipped with the app. `embed:true` bakes it INTO the
+ *  binary (served from the pkg snapshot); `embed:false` copies it NEXT TO the
+ *  binary in the output dir (served from the process working directory). */
+export interface StaticDir {
+  /** Source dir, relative to the project (or absolute). */
+  from: string
+  /** Destination path inside the binary (embed) or under the output dir (sidecar). */
+  to: string
+  embed: boolean
+}
+
+/** An extra workspace package to build and gather (e.g. a co-located frontend
+ *  whose compiled output ships with the app). Monorepo mode only. */
+export interface BuildPackage {
+  /** Workspace package name to build, e.g. "@kalagh/frontend". */
+  package: string
+  /** Build script to run (default: the package's own "build"). */
+  script?: string
+  /** The package's build-output dir, relative to the package root (default "dist"). */
+  from: string
+  /** Where the output is placed: a path inside the binary (embed) or under the
+   *  output dir next to the binary (sidecar). */
+  to: string
+  embed: boolean
+}
+
 /** Fully-resolved configuration after merging CLI flags, config file and detection. */
 export interface ResolvedConfig {
   /** Absolute path to the target project root. */
@@ -45,6 +71,10 @@ export interface ResolvedConfig {
   keepTemp: boolean
   /** Target ECMAScript level for the esbuild bundle (helps obfuscator compatibility). */
   esbuildTarget: string
+  /** Static dirs shipped with the app (embedded or sidecar). */
+  staticDirs: StaticDir[]
+  /** Extra workspace packages to build and gather (monorepo mode). */
+  buildPackages: BuildPackage[]
 }
 
 export interface DetectResult {

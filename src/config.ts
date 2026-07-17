@@ -1,6 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import type { BuildMode, DetectResult, ObfuscationLevel, ResolvedConfig, Target } from './types.js'
+import type {
+  BuildMode,
+  BuildPackage,
+  DetectResult,
+  ObfuscationLevel,
+  ResolvedConfig,
+  StaticDir,
+  Target,
+} from './types.js'
 
 /** Raw options coming from the CLI (commander) or the programmatic API. */
 export interface CliOptions {
@@ -20,6 +28,22 @@ export interface CliOptions {
   freshInstall?: boolean
   keepTemp?: boolean
   esbuildTarget?: string
+  /** Path to an external config file (JSON), outside the project. */
+  config?: string
+  /** CLI convenience for sidecar static dirs: "from[:to],…". */
+  static?: string
+  /** Serialized StaticDir[]+BuildPackage[] threaded to the in-container step. */
+  gatherJson?: string
+}
+
+/** The file/package.json config schema (a superset of CliOptions plus arrays).
+ *  `build` is omitted from the CliOptions base (there it's the --no-build
+ *  boolean); the config's build-packages list lives under `buildPackages`. */
+interface FileConfig extends Partial<Omit<CliOptions, 'build' | 'assets'>> {
+  externals?: string[]
+  assets?: string[] | string
+  staticDirs?: Array<string | Partial<StaticDir>>
+  buildPackages?: Array<string | Partial<BuildPackage>>
 }
 
 const ARCH_ALIASES: Record<string, Target['arch']> = {
@@ -80,18 +104,67 @@ function splitList(v: string | undefined): string[] {
   return v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []
 }
 
-function loadConfigFile(projectDir: string): Partial<CliOptions> & { externals?: string[]; assets?: string[] } {
+function readJsonFile(p: string, label: string): FileConfig {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8')) as FileConfig
+  } catch (e) {
+    throw new Error(`Failed to parse ${label}: ${(e as Error).message}`)
+  }
+}
+
+/**
+ * Resolve project config from three co-located sources, lowest precedence first:
+ *   1. a `node-bundle.config.json` / `.node-bundle.json` file in the project,
+ *   2. a `node-bundle` key inside the project's package.json,
+ *   3. an explicit external `--config <path>` file (wins over the above).
+ * CLI flags (applied by the caller) override all of these.
+ */
+function loadFileConfig(projectDir: string, pkgJson: Record<string, unknown>, external?: string): FileConfig {
+  let cfg: FileConfig = {}
   for (const f of ['node-bundle.config.json', '.node-bundle.json']) {
     const p = path.join(projectDir, f)
     if (fs.existsSync(p)) {
-      try {
-        return JSON.parse(fs.readFileSync(p, 'utf8'))
-      } catch (e) {
-        throw new Error(`Failed to parse ${f}: ${(e as Error).message}`)
-      }
+      cfg = readJsonFile(p, f)
+      break
     }
   }
-  return {}
+  if (pkgJson['node-bundle'] && typeof pkgJson['node-bundle'] === 'object') {
+    cfg = { ...cfg, ...(pkgJson['node-bundle'] as FileConfig) }
+  }
+  if (external) {
+    const p = path.resolve(external)
+    if (!fs.existsSync(p)) throw new Error(`--config file not found: ${p}`)
+    cfg = { ...cfg, ...readJsonFile(p, external) }
+  }
+  return cfg
+}
+
+/** Normalize a "from[:to]" string or a partial object into a StaticDir. */
+function toStaticDir(v: string | Partial<StaticDir>, embedDefault: boolean): StaticDir | undefined {
+  if (typeof v === 'string') {
+    const [from, to] = v.split(':')
+    if (!from) return undefined
+    return { from, to: to || path.basename(from), embed: embedDefault }
+  }
+  if (!v.from) return undefined
+  return { from: v.from, to: v.to || path.basename(v.from), embed: v.embed ?? embedDefault }
+}
+
+function toBuildPackage(v: string | Partial<BuildPackage>): BuildPackage | undefined {
+  // string form: "pkg:from:to" (embed defaults to false)
+  if (typeof v === 'string') {
+    const [pkg, from, to] = v.split(':')
+    if (!pkg) return undefined
+    return { package: pkg, from: from || 'dist', to: to || path.basename(pkg), embed: false }
+  }
+  if (!v.package) return undefined
+  return {
+    package: v.package,
+    script: v.script,
+    from: v.from || 'dist',
+    to: v.to || path.basename(v.package),
+    embed: v.embed ?? false,
+  }
 }
 
 export function resolveConfig(
@@ -99,7 +172,7 @@ export function resolveConfig(
   cli: CliOptions,
   detected: DetectResult,
 ): ResolvedConfig {
-  const fileCfg = loadConfigFile(projectDir)
+  const fileCfg = loadFileConfig(projectDir, detected.pkgJson, cli.config)
   const pick = <K extends keyof CliOptions>(k: K): CliOptions[K] =>
     cli[k] !== undefined ? cli[k] : (fileCfg as CliOptions)[k]
 
@@ -115,9 +188,47 @@ export function resolveConfig(
     ]),
   )
 
-  const assets = Array.from(
-    new Set([...splitList(pick('assets')), ...((fileCfg.assets as string[]) ?? [])]),
-  )
+  const fileAssets = Array.isArray(fileCfg.assets)
+    ? fileCfg.assets
+    : typeof fileCfg.assets === 'string'
+      ? splitList(fileCfg.assets)
+      : []
+  const assets = Array.from(new Set([...splitList(pick('assets')), ...fileAssets]))
+
+  // staticDirs: config array (any embed flag) + CLI --static (sidecar only).
+  const staticDirs: StaticDir[] = []
+  for (const s of fileCfg.staticDirs ?? []) {
+    const d = toStaticDir(s, false)
+    if (d) staticDirs.push(d)
+  }
+  // A --gather JSON payload (set by the monorepo orchestrator for the in-container
+  // step) carries already-resolved static dirs so they don't need re-parsing.
+  if (cli.gatherJson) {
+    try {
+      const g = JSON.parse(cli.gatherJson) as { staticDirs?: StaticDir[]; buildPackages?: BuildPackage[] }
+      for (const d of g.staticDirs ?? []) staticDirs.push(d)
+    } catch {
+      /* ignore malformed internal payload */
+    }
+  }
+  for (const s of splitList(cli.static)) {
+    const d = toStaticDir(s, false)
+    if (d) staticDirs.push(d)
+  }
+
+  const buildPackages: BuildPackage[] = []
+  for (const b of fileCfg.buildPackages ?? []) {
+    const bp = toBuildPackage(b)
+    if (bp) buildPackages.push(bp)
+  }
+  if (cli.gatherJson) {
+    try {
+      const g = JSON.parse(cli.gatherJson) as { buildPackages?: BuildPackage[] }
+      for (const bp of g.buildPackages ?? []) buildPackages.push(bp)
+    } catch {
+      /* ignore */
+    }
+  }
 
   return {
     projectDir,
@@ -137,5 +248,7 @@ export function resolveConfig(
     freshInstall: pick('freshInstall') ?? false,
     keepTemp: pick('keepTemp') ?? false,
     esbuildTarget: pick('esbuildTarget') ?? `node${nodeRange}`,
+    staticDirs,
+    buildPackages,
   }
 }

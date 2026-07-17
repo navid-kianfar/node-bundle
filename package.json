@@ -1,11 +1,12 @@
 {
-  "name": "node-bundle",
+  "name": "@navid.kianfar/node-bundle",
   "version": "0.1.0",
   "description": "Bundle & protect a Node.js app into a single self-contained, bytecode-compiled executable, per CPU architecture (amd64/arm64).",
   "type": "module",
   "bin": {
     "node-bundle": "dist/cli.cjs"
   },
+  "main": "dist/index.cjs",
   "files": [
     "dist",
     "templates",
@@ -14,10 +15,23 @@
   "engines": {
     "node": ">=18"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/navid-kianfar/node-bundle.git"
+  },
+  "homepage": "https://github.com/navid-kianfar/node-bundle#readme",
+  "bugs": {
+    "url": "https://github.com/navid-kianfar/node-bundle/issues"
+  },
+  "author": "Navid Kianfar",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "dev": "tsx src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "keywords": [
     "bundle",

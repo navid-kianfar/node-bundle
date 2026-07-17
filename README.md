@@ -49,22 +49,32 @@ casual copying / inspection impractical — which is what it does very well.
 > is host-specific and is rejected at startup when embedded in a different-OS/arch binary
 > (verified). Docker mode builds each architecture *natively* inside a Linux container.
 
-## Install / build the tool
+## Install
 
 ```bash
-pnpm install      # or npm install
+npm install -g @navid-kianfar/node-bundle    # global `node-bundle` command
+# or run without installing:
+npx -y @navid-kianfar/node-bundle --help
+```
+
+<details>
+<summary>From source</summary>
+
+```bash
+pnpm install
 pnpm build        # produces dist/cli.cjs
 # optional: npm link   (to get a global `node-bundle` command)
 ```
+</details>
 
 ## Quick start
 
 ```bash
 # Analyse a project without building anything:
-node dist/cli.cjs /path/to/your/app --analyze
+node-bundle /path/to/your/app --analyze
 
 # Build protected Linux binaries for amd64 + arm64 (auto-selects Docker on macOS):
-node dist/cli.cjs /path/to/your/app --targets amd64,arm64 --node 22 --obfuscate safe
+node-bundle /path/to/your/app --targets amd64,arm64 --node 22 --obfuscate safe
 ```
 
 Outputs land in `<project>/node-bundle-out/`:
@@ -142,17 +152,69 @@ node-bundle [projectDir] [options]
       --esbuild-target <t> esbuild target (default: node<version>)
       --analyze            detect & print a report, then exit
       --monorepo           build a pnpm-workspace package (install+build+deploy, then bundle)
-      --workspace-include <list>  monorepo: only copy these top-level subtrees (faster)
+      --workspace-include <list>  monorepo: only copy these subtrees, nested ok (faster)
+      --static <dirs>      comma "from[:to]" dirs shipped NEXT TO the binary (sidecar)
+      --config <path>      external JSON config file (outside the project)
 ```
 
 ### Architecture aliases
 
 `amd64`, `x86_64` → `x64` · `aarch64` → `arm64` · bare arch tokens default to `linux`.
 
-## Config file
+## Config
 
-Drop a `node-bundle.config.json` in the project root (CLI flags override it). See
+Configuration can live in three places (highest precedence first): **CLI flags** →
+an external file passed with **`--config <path>`** → a **`node-bundle` key inside
+`package.json`** → a **`node-bundle.config.json`** file in the project root. See
 [`templates/node-bundle.config.example.json`](templates/node-bundle.config.example.json).
+
+```jsonc
+// package.json
+{
+  "name": "myapp",
+  "node-bundle": {
+    "targets": "amd64,arm64",
+    "obfuscate": "safe",
+    "external": ["sharp"],
+    "assets": ["templates/**/*"],        // embedded into the binary (globs)
+    "staticDirs": [                       // whole folders shipped with the app
+      { "from": "public", "to": "public", "embed": false }
+    ]
+  }
+}
+```
+
+### Shipping static folders (frontends, templates, certs…)
+
+A `staticDir` is delivered one of two ways:
+
+| `embed` | Where it lands | Served from | Use when |
+|---------|----------------|-------------|----------|
+| `false` *(sidecar)* | a real folder **next to the binary** in the output dir | the process working directory (`<cwd>/<to>`) | the app already reads `process.cwd()/public` (most web apps) |
+| `true` *(embed)* | **inside the binary** (V8 snapshot) | `JSON.parse(process.env.NODE_BUNDLE_STATIC)[to]` at runtime | you want one truly self-contained file |
+
+Embedded dirs set `NODE_BUNDLE_STATIC` to a JSON map of `{ to → absolute snapshot path }`
+so app code can locate them without hard-coding `/snapshot/...` paths.
+
+### Building & gathering extra packages (monorepo)
+
+In `--monorepo` mode, `buildPackages` builds another workspace package (e.g. a
+co-located frontend) and gathers its output as a static dir — replacing the usual
+`COPY --from=frontend .../dist ./public` Docker step:
+
+```jsonc
+{
+  "node-bundle": {
+    "buildPackages": [
+      { "package": "@acme/frontend", "from": "dist", "to": "public", "embed": false }
+    ]
+  }
+}
+```
+
+node-bundle builds `@acme/frontend` in the same pass as your app (inside each per-arch
+container), then places its `dist/` as `public/` next to the binary. Make sure the
+package's subtree is copied into the build context (`--workspace-include`).
 
 ## Obfuscation levels
 
@@ -177,6 +239,38 @@ multi-arch runtime image.
 FROM gcr.io/distroless/cc-debian12
 COPY node-bundle-out/myapp-linux-x64 /usr/local/bin/myapp
 ENTRYPOINT ["/usr/local/bin/myapp"]
+```
+
+## Using node-bundle *inside* a Docker build
+
+If you protect your app as part of `docker build` (rather than running node-bundle on
+your machine and COPYing the result in), use `--mode host` and target only the stage's
+own architecture — each `docker buildx` platform stage already *is* the target arch, and
+Docker-in-Docker is not available during a build:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm AS protect
+# native-addon toolchain (only needed if your app has native deps)
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @navid-kianfar/node-bundle
+WORKDIR /app
+COPY . .
+ARG TARGETARCH
+# amd64/arm64 are accepted aliases; bare arch tokens default to linux
+RUN node-bundle . --mode host --targets ${TARGETARCH} --node 22 --obfuscate safe \
+    --out /out --name myapp \
+ && mv /out/myapp-linux-* /out/myapp
+
+FROM gcr.io/distroless/cc-debian12
+COPY --from=protect /out/myapp /usr/local/bin/myapp
+ENTRYPOINT ["/usr/local/bin/myapp"]
+```
+
+Build both architectures natively in one go:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t registry/myapp:1.0 --push .
 ```
 
 ## Native addons (bcrypt, sharp, better-sqlite3, prisma, …)

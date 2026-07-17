@@ -2,6 +2,7 @@ import { execSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import fg from 'fast-glob'
 import type { BuildArtifact, DetectResult, ResolvedConfig, Target } from './types.js'
 import { log, pc } from './logger.js'
 import { bundleApp, packageNameOf, type BundleResult } from './bundle.js'
@@ -9,6 +10,9 @@ import { obfuscateCode } from './obfuscate.js'
 import { pack } from './pack.js'
 import { installCmd } from './pm.js'
 import { scanNatives } from './natives.js'
+import { stageNativePackages } from './stage-natives.js'
+import { buildLibManifest, writeExtractPrelude } from './extract-libs.js'
+import { gatherStaticDirs, writeStaticEnvPrelude } from './gather.js'
 import { resolveEntryCandidates } from './detect.js'
 
 export interface RunResult {
@@ -154,7 +158,8 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
   // Re-scan natives now that everything is installed/built.
   const nativeScan = await scanNatives(projectDir)
   const natives = nativeScan.packages
-  const externals = Array.from(new Set([...config.externals, ...natives]))
+  const sharedLibs = nativeScan.sharedLibPackages
+  const externals = Array.from(new Set([...config.externals, ...natives, ...sharedLibs]))
 
   const entry = resolveEntry(config, detected)
   log.step('Bundle & protect')
@@ -163,6 +168,37 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
 
   const finalBundle = path.join(tmpDir, 'bundle.cjs')
   const entryForPkg = finalBundle
+
+  // Stage externalized packages next to the bundle so their runtime require()s
+  // resolve inside the snapshot (pnpm symlink layouts break pkg's own tracing).
+  const stagedNatives = stageNativePackages(projectDir, tmpDir, nativeScan.files, externals)
+  if (stagedNatives.staged.length) {
+    log.group(() =>
+      log.info(
+        `Staged ${stagedNatives.staged.length} runtime package(s) for embedding: ${stagedNatives.staged.join(', ')}`,
+      ),
+    )
+  }
+  for (const name of stagedNatives.unresolved) {
+    log.warn(`External package "${name}" not found in node_modules — its require() may fail at runtime.`)
+  }
+
+  // Shared libraries can't be dlopen'ed from the snapshot — inject a prelude
+  // that extracts those packages to a real dir and redirects their resolution.
+  const libManifest = buildLibManifest(tmpDir, sharedLibs, stagedNatives.staged)
+  const inject = libManifest.length ? [writeExtractPrelude(tmpDir, libManifest)] : []
+  if (libManifest.length) {
+    log.group(() =>
+      log.info(
+        `Shared-library package(s) will self-extract at startup: ${libManifest.map((m) => m.name).join(', ')}`,
+      ),
+    )
+  }
+
+  // Static dirs: embed into the binary and/or copy sidecar into the output dir.
+  const gathered = gatherStaticDirs(config.staticDirs, projectDir, tmpDir, config.outDir)
+  const staticEnvPrelude = writeStaticEnvPrelude(tmpDir, gathered.embedManifest)
+  if (staticEnvPrelude) inject.push(staticEnvPrelude)
 
   const logExtras = (r: BundleResult) => {
     for (const w of r.warnings) log.warn(w)
@@ -179,7 +215,7 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
     const esTarget = config.esbuildTarget
 
     if (config.obfuscate === 'off') {
-      const r = await bundleApp({ entry, outFile: finalBundle, externals, target: esTarget, minify: false })
+      const r = await bundleApp({ entry, outFile: finalBundle, externals, target: esTarget, minify: false, projectDir, inject })
       log.success(`Bundled → ${formatBytes(r.size)}`)
       logExtras(r)
       log.warn('Obfuscation disabled — only bytecode protects this build.')
@@ -196,6 +232,7 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
       target: esTarget,
       minify: false,
       externalizeAllPackages: true,
+      projectDir,
     })
     log.success(`App code bundled → ${formatBytes(a.size)} ${pc.dim(`(scope for obfuscation)`)}`)
 
@@ -209,19 +246,45 @@ export async function runHost(configIn: ResolvedConfig, detected: DetectResult):
     log.success(`Obfuscated app code (${config.obfuscate})`)
 
     // Stage B — bundle the obfuscated app together with all dependencies inlined.
-    const b = await bundleApp({ entry: obfApp, outFile: finalBundle, externals, target: esTarget, minify: false })
+    const b = await bundleApp({ entry: obfApp, outFile: finalBundle, externals, target: esTarget, minify: false, projectDir, inject })
     log.success(`Bundled with deps inlined → ${formatBytes(b.size)}`)
     logExtras(b)
     return b
   })
 
-  // 4. Write pkg config + pack per target.
-  //    Native .node files are located at runtime via dynamic helpers (bindings,
-  //    node-gyp-build) that pkg can't statically follow — embed them explicitly.
-  writePkgConfig(tmpDir, projectDir, config, entryForPkg, nativeScan.files)
-  if (nativeScan.files.length) {
-    log.group(() => log.info(`Embedding ${nativeScan.files.length} native .node file(s) as assets`))
+  // Inlined packages that use __dirname/__filename read sibling files at runtime
+  // (protos, templates, certs, wasm…) — embed their non-code files so those reads
+  // resolve inside the snapshot at the preserved paths.
+  const autoAssets: string[] = []
+  for (const pkgDir of result.dirnamePackages) {
+    const files = fg.sync(['**/*'], {
+      cwd: pkgDir,
+      dot: false,
+      followSymbolicLinks: false,
+      suppressErrors: true,
+      onlyFiles: true,
+      ignore: ['**/*.js', '**/*.cjs', '**/*.mjs', '**/*.ts', '**/*.map', '**/*.md', '**/node_modules/**', '**/LICENSE*', '**/license*'],
+    })
+    for (const f of files) autoAssets.push(path.join(pkgDir, f))
   }
+  if (autoAssets.length) {
+    const total = autoAssets.reduce((n, f) => n + (fs.statSync(f).size || 0), 0)
+    log.group(() =>
+      log.info(
+        `Auto-embedding ${autoAssets.length} runtime data file(s) (${formatBytes(total)}) from ${result.dirnamePackages.length} package(s) that use __dirname`,
+      ),
+    )
+  }
+
+  // 4. Write the pkg config + pack per target.
+  writePkgConfig(
+    tmpDir,
+    projectDir,
+    { ...config, assets: [...config.assets, ...autoAssets] },
+    entryForPkg,
+    stagedNatives.staged.length > 0,
+    gathered.embedAssets,
+  )
 
   log.step('Pack (bytecode + executable)')
   const outcome = await pack({
@@ -249,14 +312,18 @@ export function writePkgConfig(
   projectDir: string,
   config: ResolvedConfig,
   entryForPkg: string,
-  nativeFiles: string[] = [],
+  includeStagedModules = false,
+  /** Extra globs already relative to tmpDir (embedded static dirs). */
+  tmpRelativeAssets: string[] = [],
 ): void {
   // pkg resolves asset globs relative to this package.json — rewrite project-relative
   // paths/globs to be relative to tmpDir.
   const toTmpRel = (p: string) =>
     path.relative(tmpDir, path.resolve(projectDir, p)).split(path.sep).join('/')
 
-  const assets = Array.from(new Set([...config.assets, ...nativeFiles].map(toTmpRel)))
+  const assets = Array.from(new Set([...config.assets.map(toTmpRel), ...tmpRelativeAssets]))
+  // The staged native/external packages live inside tmpDir itself.
+  if (includeStagedModules) assets.push('node_modules/**/*')
 
   const pkgConfig = {
     name: config.name,

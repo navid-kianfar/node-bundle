@@ -1,6 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { builtinModules } from 'node:module'
 import { build, type Message, type Plugin } from 'esbuild'
+
+/** Every Node built-in module name (bare, no "node:" prefix). */
+const NODE_BUILTINS = new Set(builtinModules)
 
 export interface BundleOptions {
   /** Absolute path to the entry file (compiled JS, or a prior bundle stage). */
@@ -15,6 +19,12 @@ export interface BundleOptions {
   minify: boolean
   /** Externalize EVERY bare import (used for the app-only obfuscation stage). */
   externalizeAllPackages?: boolean
+  /** Project root — anchors per-module __dirname preservation. The final bundle
+   *  is expected to live two directories below it (.node-bundle/tmp). */
+  projectDir?: string
+  /** Files whose side effects run before the entry (esbuild `inject`) — used for
+   *  the shared-library extraction prelude. */
+  inject?: string[]
 }
 
 export interface BundleResult {
@@ -25,6 +35,9 @@ export interface BundleResult {
   externalized: string[]
   /** Bare specifiers externalized because they failed to resolve (optional peers). */
   externalizedMissing: string[]
+  /** node_modules package dirs (absolute) whose inlined code uses __dirname/__filename —
+   *  they likely read sibling data files at runtime and should be embedded as assets. */
+  dirnamePackages: string[]
 }
 
 function formatMessages(msgs: Message[]): string[] {
@@ -69,6 +82,12 @@ function externalizePlugin(
         if (args.kind === 'entry-point') return null
         if (args.path.startsWith('.') || path.isAbsolute(args.path)) return null
         if (args.path.startsWith('node:')) return ext(args.path)
+        // A Node built-in (buffer, events, crypto, …) must map to the REAL
+        // builtin, never a userland polyfill of the same name that happens to be
+        // installed (e.g. the "buffer" npm package, which lacks
+        // buffer.constants.MAX_STRING_LENGTH and breaks pino/thread-stream).
+        // build.resolve() below would pick the userland copy — short-circuit it.
+        if (NODE_BUILTINS.has(args.path)) return ext(args.path)
         if (externalizeEverything) return ext(args.path)
         if (externals.has(args.path) || externals.has(packageNameOf(args.path))) return ext(args.path)
         if (args.pluginData === RESOLVE_SENTINEL) return null // recursion guard
@@ -89,6 +108,77 @@ function externalizePlugin(
 }
 
 /**
+ * Bundling relocates every module into one file, so the runtime __dirname no
+ * longer points at each module's original directory — breaking the very common
+ * `path.join(__dirname, '../data/file')` pattern. This plugin restores original
+ * semantics by injecting per-module `__filename`/`__dirname` constants computed
+ * from `__nb_root` (resolved at runtime from the bundle's own location, so the
+ * SAME code works inside a pkg snapshot and on a plain filesystem).
+ *
+ * It also records which node_modules packages use __dirname/__filename — the
+ * caller embeds their non-code files as pkg assets so those runtime reads
+ * resolve inside the snapshot.
+ */
+function preserveDirnamePlugin(projectDir: string, dirnamePkgs: Set<string>): Plugin {
+  const owningPackageDir = (file: string): string | undefined => {
+    let dir = path.dirname(file)
+    while (dir.includes('node_modules')) {
+      if (fs.existsSync(path.join(dir, 'package.json'))) return dir
+      const parent = path.dirname(dir)
+      if (parent === dir) return undefined
+      dir = parent
+    }
+    return undefined
+  }
+
+  return {
+    name: 'nb-preserve-dirname',
+    setup(build) {
+      build.onLoad({ filter: /\.(c|m)?js$/ }, async (args) => {
+        let src: string
+        try {
+          src = await fs.promises.readFile(args.path, 'utf8')
+        } catch {
+          return null
+        }
+        const needsDir = /__dirname|__filename/.test(src)
+        const needsMeta = /import\.meta/.test(src)
+        if (!needsDir && !needsMeta) return null
+
+        const relFile = path.relative(projectDir, args.path).split(path.sep).join('/')
+        const lines: string[] = []
+        if (needsDir) {
+          lines.push(
+            `var __filename=require("path").join(__nb_root,${JSON.stringify(relFile)}),` +
+              `__dirname=require("path").dirname(__filename);`,
+          )
+          if (args.path.includes('node_modules')) {
+            const pkgDir = owningPackageDir(args.path)
+            if (pkgDir) dirnamePkgs.add(pkgDir)
+          }
+        }
+        if (needsMeta) {
+          lines.push(
+            `var __nb_import_meta_url=require("url").pathToFileURL(require("path").join(__nb_root,${JSON.stringify(relFile)})).href;`,
+          )
+        }
+
+        // Keep a shebang (if any) on the first line — injecting above it would
+        // turn it into a syntax error.
+        let contents: string
+        if (src.startsWith('#!')) {
+          const nl = src.indexOf('\n')
+          contents = nl === -1 ? src : `${src.slice(0, nl + 1)}${lines.join('')}\n${src.slice(nl + 1)}`
+        } else {
+          contents = `${lines.join('')}\n${src}`
+        }
+        return { contents }
+      })
+    },
+  }
+}
+
+/**
  * Bundle the entry and (unless externalizeAllPackages) all of its pure-JS
  * dependencies into one CommonJS file. Native packages and unresolvable optional
  * peers are kept external so pkg can embed/guard them at pack time.
@@ -99,6 +189,8 @@ export async function bundleApp(opts: BundleOptions): Promise<BundleResult> {
   const externalsSet = new Set(opts.externals)
   const missing = new Set<string>()
   const externalizedAll = new Set<string>()
+  const dirnamePkgs = new Set<string>()
+  const projectDir = opts.projectDir ?? path.dirname(opts.entry)
 
   const result = await build({
     entryPoints: [opts.entry],
@@ -116,14 +208,25 @@ export async function bundleApp(opts: BundleOptions): Promise<BundleResult> {
     // We bundle already-compiled JS — ignore any project tsconfig (and its
     // "extends" chain, which won't exist in a deployed package).
     tsconfigRaw: '{}',
+    inject: opts.inject ?? [],
     plugins: [
+      preserveDirnamePlugin(projectDir, dirnamePkgs),
       externalizePlugin(externalsSet, missing, externalizedAll, opts.externalizeAllPackages ?? false),
     ],
     define: {
       'import.meta.url': '__nb_import_meta_url',
     },
+    // __nb_root: where the project root lives at runtime. The bundle always sits
+    // at <root>/.node-bundle/tmp/<bundle>.cjs, so three ups from the file — valid
+    // on the real filesystem AND inside a pkg snapshot (both keep that layout).
+    // NOTE: must not reference __dirname/__filename directly — the entry module's
+    // injected `var __dirname` hoists over the banner and would shadow them as
+    // undefined. process.argv[1] (pkg entry) / module.filename are hoist-proof.
     banner: {
-      js: "const __nb_import_meta_url=require('url').pathToFileURL(__filename).href;",
+      js:
+        "var __nb_file=(process.pkg&&process.argv[1])||(typeof module!=='undefined'&&module.filename)||'.';" +
+        "var __nb_root=require('path').resolve(__nb_file,'..','..','..');" +
+        'const __nb_import_meta_url=require(\'url\').pathToFileURL(__nb_file).href;',
     },
   })
 
@@ -133,5 +236,6 @@ export async function bundleApp(opts: BundleOptions): Promise<BundleResult> {
     warnings: formatMessages(result.warnings),
     externalized: [...externalizedAll].sort(),
     externalizedMissing: [...missing].sort(),
+    dirnamePackages: [...dirnamePkgs].sort(),
   }
 }

@@ -40,9 +40,10 @@ RUN apt-get update \\
 RUN corepack enable
 
 WORKDIR /opt/node-bundle
+# package.json + install first so tool-code changes don't re-install deps
 COPY package.json ./
-COPY dist ./dist
 RUN npm install --omit=dev --no-audit --no-fund
+COPY dist ./dist
 
 ENV NODE_BUNDLE_IN_DOCKER=1
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
@@ -140,6 +141,11 @@ function innerArgs(config: ResolvedConfig, arch: string): string[] {
   if (config.entry) args.push('--entry', config.entry)
   if (config.assets.length) args.push('--assets', config.assets.join(','))
   if (config.externals.length) args.push('--external', config.externals.join(','))
+  // Static dirs are resolved on the host; pass them pre-parsed (from paths are
+  // relative to the project, mounted at /work/project) to the in-container step.
+  if (config.staticDirs.length) {
+    args.push('--gather-json', JSON.stringify({ staticDirs: config.staticDirs }))
+  }
   return args
 }
 
@@ -231,6 +237,14 @@ export async function runMonorepoDocker(
     if (config.ext) inner.push('--ext', config.ext)
     if (!config.bytecode) inner.push('--no-bytecode')
     if (opts.include?.length) inner.push('--workspace-include', opts.include.join(','))
+    // Thread the build/gather spec (e.g. the co-located frontend) into the
+    // in-container deploy step, which has the whole workspace available.
+    if (config.buildPackages.length || config.staticDirs.length) {
+      inner.push(
+        '--gather-json',
+        JSON.stringify({ buildPackages: config.buildPackages, staticDirs: config.staticDirs }),
+      )
+    }
 
     execFileSync(
       'docker',

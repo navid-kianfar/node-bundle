@@ -1,5 +1,5 @@
 {
-  "$comment": "Drop this file (named node-bundle.config.json) in your project root. CLI flags override it.",
+  "$comment": "node-bundle config. Put these fields in a `node-bundle` key inside package.json, in a node-bundle.config.json file, or pass an external file with --config. CLI flags override everything.",
   "name": "myapp",
   "node": "22",
   "targets": "linux-x64,linux-arm64",
@@ -11,5 +11,11 @@
   "entry": "dist/main.js",
   "assets": ["views/**/*", "config/*.json"],
   "externals": ["bcrypt", "sharp"],
-  "ext": ""
+  "ext": "",
+  "staticDirs": [
+    { "from": "public", "to": "public", "embed": false }
+  ],
+  "buildPackages": [
+    { "package": "@acme/frontend", "from": "dist", "to": "public", "embed": false }
+  ]
 }

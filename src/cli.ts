@@ -75,28 +75,38 @@ async function main(): Promise<void> {
     .option('--build-command <cmd>', 'override the detected build command')
     .option('--entry <file>', 'override the (post-build) entry file')
     .option('--assets <globs>', 'comma list of extra file globs to embed (pkg assets)')
+    .option('--static <dirs>', 'comma list of "from[:to]" dirs shipped NEXT TO the binary (sidecar)')
+    .option('--config <path>', 'path to an external JSON config file (outside the project)')
     .option('--external <pkgs>', 'comma list of extra packages to keep out of the bundle')
     .option('--fresh-install', 'copy project to temp and reinstall deps before building')
     .option('--keep-temp', 'keep the .node-bundle working directory')
     .option('--esbuild-target <t>', 'esbuild target (default: node<version>)')
     .option('--analyze', 'detect & print a report, then exit (no build)')
     .option('--monorepo', 'treat target as a pnpm-workspace package (build via pnpm deploy)')
-    .option('--workspace-include <list>', 'monorepo: only copy these top-level subtrees (faster)')
+    .option('--workspace-include <list>', 'monorepo: only copy these subtrees, nested paths allowed e.g. "apps/socket,packages" (faster)')
     // Internal flags used by the in-container monorepo step.
     .addOption(new Option('--monorepo-deploy', 'internal').hideHelp())
     .addOption(new Option('--monorepo-root <dir>', 'internal').hideHelp())
     .addOption(new Option('--monorepo-pkg <name>', 'internal').hideHelp())
+    .addOption(new Option('--gather-json <json>', 'internal').hideHelp())
     .action(async (projectDirArg: string, opts: Options) => {
       // ── Internal: runs INSIDE the per-arch container. Deploy the workspace
       //    package to a self-contained dir, then bundle it with the host pipeline.
       if (opts.monorepoDeploy) {
-        const appDir = runMonorepoDeploy({
+        const gather = opts.gatherJson
+          ? (JSON.parse(opts.gatherJson) as { buildPackages?: ResolvedConfig['buildPackages'] })
+          : {}
+        const { appDir, staticDirs } = runMonorepoDeploy({
           root: opts.monorepoRoot!,
           pkg: opts.monorepoPkg!,
           include: splitList(opts.workspaceInclude),
+          buildPackages: gather.buildPackages,
         })
         const det = await detect(appDir)
         const cfg = resolveConfig(appDir, { ...opts, build: false }, det)
+        // Static dirs gathered from buildPackages live under appDir — merge them
+        // into the config the host pipeline will embed/sidecar.
+        cfg.staticDirs = [...cfg.staticDirs, ...staticDirs]
         const res = await runHost(cfg, det)
         if (!process.env.NODE_BUNDLE_IN_DOCKER) summarize(res, cfg)
         if (res.artifacts.some((a) => a.size === 0)) process.exitCode = 1
