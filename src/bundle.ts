@@ -147,10 +147,23 @@ function preserveDirnamePlugin(projectDir: string, dirnamePkgs: Set<string>): Pl
 
         const relFile = path.relative(projectDir, args.path).split(path.sep).join('/')
         const lines: string[] = []
+        // These call __nb_require, never the bare `require`. The shim is
+        // prepended INTO the module's source, so esbuild resolves identifiers
+        // in it against that module's scope — and a module that writes the
+        // standard ESM idiom
+        //
+        //   const require = createRequire(import.meta.url)
+        //
+        // has its own binding named `require`. esbuild renames it (`require2`)
+        // and renames the shim's calls with it, so the shim ends up invoking
+        // the module's require BEFORE the line that assigns it: "TypeError:
+        // undefined is not a function" at module init, from a package the app
+        // never touched directly (css-tree, via jsdom). __nb_require is the
+        // real CJS require captured in the banner, above every module scope.
         if (needsDir) {
           lines.push(
-            `var __filename=require("path").join(__nb_root,${JSON.stringify(relFile)}),` +
-              `__dirname=require("path").dirname(__filename);`,
+            `var __filename=__nb_require("path").join(__nb_root,${JSON.stringify(relFile)}),` +
+              `__dirname=__nb_require("path").dirname(__filename);`,
           )
           if (args.path.includes('node_modules')) {
             const pkgDir = owningPackageDir(args.path)
@@ -159,8 +172,17 @@ function preserveDirnamePlugin(projectDir: string, dirnamePkgs: Set<string>): Pl
         }
         if (needsMeta) {
           lines.push(
-            `var __nb_import_meta_url=require("url").pathToFileURL(require("path").join(__nb_root,${JSON.stringify(relFile)})).href;`,
+            `var __nb_import_meta_url=__nb_require("url").pathToFileURL(__nb_require("path").join(__nb_root,${JSON.stringify(relFile)})).href;`,
           )
+          // `createRequire(import.meta.url)` then `require('./data.json')` is
+          // the ESM way of reading a sibling data file — the exact thing the
+          // __dirname branch above collects packages for. Collect these too, or
+          // the path resolves correctly at runtime to a file that was never
+          // embedded.
+          if (args.path.includes('node_modules')) {
+            const pkgDir = owningPackageDir(args.path)
+            if (pkgDir) dirnamePkgs.add(pkgDir)
+          }
         }
 
         // Keep a shebang (if any) on the first line — injecting above it would
@@ -222,11 +244,29 @@ export async function bundleApp(opts: BundleOptions): Promise<BundleResult> {
     // NOTE: must not reference __dirname/__filename directly — the entry module's
     // injected `var __dirname` hoists over the banner and would shadow them as
     // undefined. process.argv[1] (pkg entry) / module.filename are hoist-proof.
+    // `var`, not `const`, for the same reason the two above it are `var` — and
+    // this one matters more. esbuild never parses a banner (it is raw text
+    // prepended after bundling), so it cannot rename around anything declared
+    // here. Meanwhile the onLoad shim declares `var __nb_import_meta_url` in
+    // code esbuild DOES parse, and esbuild is free to hoist that var into the
+    // top-level scope — which it does for modules bundled into the root scope
+    // rather than a __commonJS wrapper (e.g. pdfjs-dist). `const` + `var` on
+    // one name in one scope is a hard SyntaxError, so the whole bundle failed
+    // to parse: obfuscation was skipped, bytecode generation failed, the source
+    // fallback could not be embedded either, and the binary died at startup
+    // with "[pkg] UNEXPECTED-20: no source or bytecode". With both as `var` the
+    // redeclaration is legal; the hoisted one carries no initializer, so the
+    // banner's value stands until the owning module assigns its own — which is
+    // exactly the intended precedence.
     banner: {
       js:
+        // The real CJS require, captured at top level where nothing can have
+        // shadowed it. Every injected shim goes through this rather than the
+        // bare identifier — see the onLoad plugin for why that matters.
+        'var __nb_require=require;' +
         "var __nb_file=(process.pkg&&process.argv[1])||(typeof module!=='undefined'&&module.filename)||'.';" +
-        "var __nb_root=require('path').resolve(__nb_file,'..','..','..');" +
-        'const __nb_import_meta_url=require(\'url\').pathToFileURL(__nb_file).href;',
+        "var __nb_root=__nb_require('path').resolve(__nb_file,'..','..','..');" +
+        'var __nb_import_meta_url=__nb_require(\'url\').pathToFileURL(__nb_file).href;',
     },
   })
 

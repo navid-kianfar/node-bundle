@@ -6,13 +6,63 @@ import { log } from './logger.js'
 /**
  * Node built-in module names. A userland package that shares one of these names
  * (the "buffer", "string_decoder", "punycode", … polyfills, pulled in as
- * transitive deps of native packages) must NEVER be staged: `require("buffer")`
- * resolves to the builtin in plain Node, but inside a pkg snapshot an embedded
- * node_modules/buffer SHADOWS the builtin — and these browser polyfills lack
- * Node-only APIs (e.g. buffer.constants.MAX_STRING_LENGTH, which pino needs),
- * so the app crashes at startup.
+ * transitive deps of native packages) must not be staged for a BARE require:
+ * `require("buffer")` resolves to the builtin in plain Node, but inside a pkg
+ * snapshot an embedded node_modules/buffer SHADOWS the builtin — and these
+ * browser polyfills lack Node-only APIs (e.g. buffer.constants
+ * .MAX_STRING_LENGTH, which pino needs), so the app crashes at startup.
+ *
+ * The trailing-slash form is the documented exception — see requiresSlashForm.
  */
 const NODE_BUILTIN_NAMES = new Set(builtinModules)
+
+/**
+ * Does `dependentDir` require `<name>` with a TRAILING SLASH?
+ *
+ * `require('punycode/')` is the long-standing convention for "the userland
+ * package, explicitly NOT the builtin of the same name", and Node cannot
+ * resolve it to a builtin — the slash forces directory resolution through
+ * node_modules. So the shadowing hazard the skip-list above exists to prevent
+ * cannot arise from it, while skipping the package guarantees the dependent
+ * dies with `Cannot find module 'punycode/'`. `tr46` (via whatwg-url, via
+ * jsdom) is the common case.
+ *
+ * Scoped to the ONE package that declared the dependency rather than the whole
+ * staged tree: that is where the specifier has to appear, and it keeps this to
+ * a handful of files instead of walking something the size of jsdom. Bounded,
+ * because a false negative only costs the previous behaviour.
+ */
+function requiresSlashForm(dependentDir: string, name: string): boolean {
+  const needles = [`'${name}/'`, `"${name}/"`, `\`${name}/\``]
+  const stack = [dependentDir]
+  let scanned = 0
+  while (stack.length) {
+    const dir = stack.pop()!
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name !== 'node_modules') stack.push(full)
+        continue
+      }
+      if (!/\.(?:js|cjs|mjs)$/.test(entry.name)) continue
+      if (++scanned > 400) return false
+      let src: string
+      try {
+        src = fs.readFileSync(full, 'utf8')
+      } catch {
+        continue
+      }
+      if (needles.some((n) => src.includes(n))) return true
+    }
+  }
+  return false
+}
 
 /**
  * Stage externalized (native) packages into <tmpDir>/node_modules so pkg can
@@ -112,11 +162,16 @@ export function stageNativePackages(
   const unresolved: string[] = []
   const queue: string[] = [] // real dirs whose deps still need staging
 
-  const copyPackage = (realDir: string): void => {
+  const copyPackage = (realDir: string, allowBuiltinName = false): void => {
     const name = readPkgName(realDir)
     if (!name || staged.has(name)) return
-    // Skip polyfills that shadow a Node builtin inside the pkg snapshot.
-    if (NODE_BUILTIN_NAMES.has(name)) return
+    // Skip polyfills that shadow a Node builtin inside the pkg snapshot —
+    // unless the caller established that it is required by its trailing-slash
+    // name, which cannot resolve to a builtin and so cannot shadow one.
+    if (NODE_BUILTIN_NAMES.has(name) && !allowBuiltinName) return
+    if (NODE_BUILTIN_NAMES.has(name)) {
+      log.info(`Staging ${name}: required as "${name}/", which never resolves to the builtin.`)
+    }
     staged.set(name, realDir)
     const dest = path.join(destRoot, ...name.split('/'))
     fs.mkdirSync(path.dirname(dest), { recursive: true })
@@ -172,12 +227,16 @@ export function stageNativePackages(
       if (staged.has(dep)) continue
       const dir = resolvePackageDir(realDir, dep)
       if (dir) {
+        // A builtin-named dep is staged only when THIS dependent asks for it by
+        // its trailing-slash name; every other case keeps the old skip.
+        const allowBuiltinName =
+          NODE_BUILTIN_NAMES.has(dep) && requiresSlashForm(realDir, dep)
         const already = staged.get(readPkgName(dir) ?? dep)
         if (already && already !== dir) {
           log.warn(`Staging ${dep}: multiple versions in the native closure — keeping the first.`)
           continue
         }
-        copyPackage(dir)
+        copyPackage(dir, allowBuiltinName)
       }
       // absent optional/peer deps are fine — the package guards them at runtime
     }

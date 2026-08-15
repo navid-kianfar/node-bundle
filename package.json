@@ -1,6 +1,6 @@
 {
   "name": "@navid.kianfar/node-bundle",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Bundle & protect a Node.js app into a single self-contained, bytecode-compiled executable, per CPU architecture (amd64/arm64).",
   "type": "module",
   "bin": {
